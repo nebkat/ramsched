@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Memory-budgeted compiler launcher.
+
+Usage as a prefix:  compile-memory <compiler> <args...>
+Report:             compile-memory --report
+
+Each compile reserves an estimate (recent peak + margin) from a machine-wide
+budget before it starts. While it runs its process group's memory is polled; at
+the reservation it grows the reservation if the budget allows, otherwise it is
+SIGSTOPped until budget frees up. If every holder of memory is paused, the one
+that has run the shortest is killed and requeued with a larger reservation.
+
+Any internal failure falls back to running the compiler directly.
+
+Environment:
+  COMPILE_MEMORY_BUDGET   GB available to compiles, or "off" (default: RAM - reserve)
+  COMPILE_MEMORY_RESERVE  GB kept back when the budget is derived from RAM (default 4)
+  COMPILE_MEMORY_DIR      ledger directory, live builds only (default /tmp/compile-memory)
+  COMPILE_MEMORY_HISTORY  peak history file (default ~/.cache/compile-memory/history.json)
+  COMPILE_MEMORY_DEFAULT  GB reserved for a command with no history (default 2 for C++, 0.5 otherwise)
+"""
+
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+GB = 1 << 30
+MB = 1 << 20
+MARGIN = 1.15
+GROW_MINIMUM = 256 * MB
+POLL_SECONDS = 0.1
+WAIT_SECONDS = 0.2
+PROTECT_AFTER_SECONDS = 30.0
+LOCK_TIMEOUT_SECONDS = 10.0
+HISTORY_DEPTH = 3
+DEFAULT_ESTIMATE = {'c': 512 * MB, 'cpp': 2 * GB}
+
+STATE_DIRECTORY = os.environ.get('COMPILE_MEMORY_DIR', '/tmp/compile-memory')
+LEDGER_PATH = os.path.join(STATE_DIRECTORY, 'ledger.json')
+HISTORY_PATH = os.environ.get('COMPILE_MEMORY_HISTORY',
+                              os.path.expanduser('~/.cache/compile-memory/history.json'))
+LOCK_PATH = os.path.join(STATE_DIRECTORY, 'lock')
+EVENTS_PATH = os.path.join(STATE_DIRECTORY, 'events.log')
+
+
+class LockTimeout(Exception):
+    pass
+
+
+# --- platform memory measurement -------------------------------------------------
+
+if sys.platform == 'darwin':
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    RUSAGE_INFO_V2 = 2
+    PHYS_FOOTPRINT_OFFSET = 16 + 8 * 7  # uuid, then 7 uint64 fields precede phys_footprint
+
+    def group_pids(process_group):
+        buffer = (ctypes.c_int * 1024)()
+        count = libproc.proc_listpgrppids(process_group, buffer, ctypes.sizeof(buffer))
+        return [buffer[i] for i in range(max(count, 0)) if buffer[i] > 0]
+
+    def process_memory(pid):
+        buffer = ctypes.create_string_buffer(512)
+        if libproc.proc_pid_rusage(pid, RUSAGE_INFO_V2, buffer) != 0:
+            return 0
+        return int.from_bytes(buffer.raw[PHYS_FOOTPRINT_OFFSET:PHYS_FOOTPRINT_OFFSET + 8], 'little')
+
+    def physical_memory():
+        return int(subprocess.check_output(['sysctl', '-n', 'hw.memsize']))
+
+    PROC_PIDTBSDINFO = 3
+    PROC_BSDINFO_SIZE = 136
+    SZOMB = 5
+
+    def zombie(pid):
+        # A zombie still accepts kill(pid, 0) but has no BSD info left: ESRCH.
+        buffer = ctypes.create_string_buffer(PROC_BSDINFO_SIZE)
+        if libproc.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, buffer, PROC_BSDINFO_SIZE) <= 0:
+            return ctypes.get_errno() == errno.ESRCH
+        return int.from_bytes(buffer.raw[4:8], 'little') == SZOMB
+else:
+    PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')
+
+    def descendants(pid):
+        pids, pending = [], [pid]
+        while pending:
+            current = pending.pop()
+            pids.append(current)
+            try:
+                for task in os.listdir(f'/proc/{current}/task'):
+                    with open(f'/proc/{current}/task/{task}/children') as children:
+                        pending.extend(int(child) for child in children.read().split())
+            except OSError:
+                pass
+        return pids
+
+    def group_pids(process_group):
+        if os.path.exists(f'/proc/{process_group}/task/{process_group}/children'):
+            return descendants(process_group)
+        pids = []
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f'/proc/{entry}/stat') as stat:
+                    fields = stat.read().rsplit(')', 1)[1].split()
+                if int(fields[2]) == process_group:
+                    pids.append(int(entry))
+            except (OSError, IndexError, ValueError):
+                pass
+        return pids
+
+    def process_memory(pid):
+        try:
+            with open(f'/proc/{pid}/statm') as statm:
+                return int(statm.read().split()[1]) * PAGE_SIZE
+        except (OSError, IndexError, ValueError):
+            return 0
+
+    def zombie(pid):
+        try:
+            with open(f'/proc/{pid}/stat') as stat:
+                return stat.read().rsplit(')', 1)[1].split()[0] == 'Z'
+        except (OSError, IndexError):
+            return False
+
+    def physical_memory():
+        total = os.sysconf('SC_PHYS_PAGES') * PAGE_SIZE
+        try:
+            with open('/sys/fs/cgroup/memory.max') as limit:
+                value = limit.read().strip()
+            if value != 'max':
+                total = min(total, int(value))
+        except OSError:
+            pass
+        return total
+
+
+def group_memory(process_group):
+    return sum(process_memory(pid) for pid in group_pids(process_group))
+
+
+def budget_bytes():
+    configured = os.environ.get('COMPILE_MEMORY_BUDGET')
+    if configured:
+        return int(float(configured) * GB)
+    reserve = float(os.environ.get('COMPILE_MEMORY_RESERVE', '4'))
+    return physical_memory() - int(reserve * GB)
+
+
+# --- shared state ----------------------------------------------------------------
+
+class State:
+    """Ledger and history under one exclusive lock."""
+
+    def __enter__(self):
+        self.lock_file = open(LOCK_PATH, 'a')
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    self.lock_file.close()
+                    raise LockTimeout()
+                time.sleep(0.01)
+        self.ledger = read_json(LEDGER_PATH, {})
+        self.ledger_changed = False
+        self.history = None
+        return self
+
+    def load_history(self):
+        if self.history is None:
+            self.history = read_json(HISTORY_PATH, {})
+        return self.history
+
+    def __exit__(self, *exception):
+        try:
+            if self.ledger_changed:
+                write_json(LEDGER_PATH, self.ledger)
+            if self.history is not None:
+                write_json(HISTORY_PATH, self.history)
+        finally:
+            fcntl.flock(self.lock_file, fcntl.LOCK_UN)
+            self.lock_file.close()
+
+    def set_job(self, key, **fields):
+        self.ledger.setdefault(key, {}).update(fields)
+        self.ledger_changed = True
+
+    def remove_job(self, key):
+        if self.ledger.pop(key, None) is not None:
+            self.ledger_changed = True
+
+    def prune_dead(self):
+        for key, job in list(self.ledger.items()):
+            if alive(int(key)):
+                continue
+            process_group = job.get('process_group')
+            if process_group:
+                signal_group(process_group, signal.SIGKILL)
+                signal_group(process_group, signal.SIGCONT)
+            self.remove_job(key)
+            log_event('pruned', key, job.get('object', '?'))
+
+    def held(self, excluding=None):
+        return sum(job['reserved'] for key, job in self.ledger.items()
+                   if key != excluding and job['state'] in ('running', 'paused'))
+
+
+def read_json(path, default):
+    try:
+        with open(path) as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, value):
+    temporary = f'{path}.{os.getpid()}'
+    with open(temporary, 'w') as file:
+        json.dump(value, file)
+    os.replace(temporary, path)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return not zombie(pid)
+
+
+def signal_group(process_group, number):
+    try:
+        os.killpg(process_group, number)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def log_event(*fields):
+    try:
+        with open(EVENTS_PATH, 'a') as file:
+            file.write('%.3f\t%s\n' % (time.time(), '\t'.join(str(field) for field in fields)))
+    except OSError:
+        pass
+
+
+# --- the launcher ----------------------------------------------------------------
+
+def history_key(object_path, arguments):
+    build_directory = os.getcwd()
+    parent, name = os.path.split(build_directory)
+    prefix = '/'.join((os.path.basename(parent), name))
+    if object_path:
+        return '/'.join((prefix, os.path.relpath(object_path, build_directory)))
+    digest = hashlib.sha256('\0'.join([build_directory] + arguments).encode()).hexdigest()[:16]
+    return f'{prefix}/#{digest}'
+
+
+def output_path(arguments):
+    for index, argument in enumerate(arguments[:-1]):
+        if argument == '-o':
+            return os.path.abspath(arguments[index + 1])
+    return None
+
+
+def language(arguments):
+    sources = [a for a in arguments if a.endswith(('.c', '.cpp', '.cc', '.cxx', '.S', '.s'))]
+    return 'cpp' if any(s.endswith(('.cpp', '.cc', '.cxx')) for s in sources) else 'c'
+
+
+def estimate(history, key, arguments):
+    peaks = history.get(key, {}).get('peaks') if key else None
+    if peaks:
+        return int(max(peaks) * MARGIN)
+    directory = os.path.dirname(key) if key and '#' not in key else None
+    siblings = sorted(max(entry['peaks']) for path, entry in history.items()
+                      if directory and path.startswith(directory + '/') and entry.get('peaks'))
+    if siblings:
+        return int(siblings[len(siblings) // 2] * MARGIN)
+    configured = os.environ.get('COMPILE_MEMORY_DEFAULT')
+    if configured:
+        return int(float(configured) * GB)
+    return DEFAULT_ESTIMATE[language(arguments)]
+
+
+class Launcher:
+    def __init__(self, arguments):
+        self.arguments = arguments
+        self.key = str(os.getpid())
+        self.object_path = output_path(arguments)
+        self.history_key = history_key(self.object_path, arguments)
+        self.budget = budget_bytes()
+        self.child = None
+        self.peak = 0
+        self.forwarded_signal = None
+        self.started = None
+
+    def admissible(self, state, reservation):
+        held = state.held()
+        if held == 0:
+            return True
+        pending_growth = sum(job['want'] - job['reserved'] for job in state.ledger.values()
+                             if job['state'] == 'paused')
+        committed = held + pending_growth
+        waiting = sorted((job['since'], key) for key, job in state.ledger.items()
+                         if job['state'] == 'waiting')
+        if waiting:
+            oldest_since, oldest_key = waiting[0]
+            if oldest_key != self.key and time.time() - oldest_since > PROTECT_AFTER_SECONDS:
+                committed += state.ledger[oldest_key]['reserved']
+        return committed + reservation <= self.budget
+
+    def acquire(self, reservation):
+        with State() as state:
+            state.set_job(self.key, state='waiting', reserved=reservation, want=reservation,
+                          since=time.time(), object=self.object_path or self.history_key)
+        waited = False
+        while True:
+            with State() as state:
+                state.prune_dead()
+                if self.admissible(state, reservation):
+                    state.set_job(self.key, state='running', reserved=reservation, want=reservation)
+                    break
+            waited = True
+            time.sleep(WAIT_SECONDS)
+        log_event('admit', self.key, reservation, 'waited' if waited else 'immediate', self.object_path)
+
+    def try_grow(self, wanted):
+        with State() as state:
+            state.prune_dead()
+            job = state.ledger[self.key]
+            others = state.held(excluding=self.key)
+            if others + wanted <= self.budget or others == 0:
+                state.set_job(self.key, state='running', reserved=wanted, want=wanted)
+                return True, None
+            if job['state'] != 'paused':
+                state.set_job(self.key, state='paused', want=wanted, paused_at=time.time())
+            running = [key for key, other in state.ledger.items() if other['state'] == 'running']
+            if running:
+                return False, None
+            paused = sorted((other['run_seconds'], key) for key, other in state.ledger.items()
+                            if other['state'] == 'paused')
+            return False, paused[0][1] == self.key
+
+    def run(self):
+        with State() as state:
+            reservation = estimate(state.load_history(), self.history_key, self.arguments)
+        while True:
+            self.acquire(reservation)
+            outcome = self.run_child(reservation)
+            if outcome != 'killed':
+                return outcome
+            reservation = int(max(self.peak, reservation) * 1.5)
+            log_event('requeue', self.key, reservation, self.object_path)
+
+    def run_child(self, reservation):
+        self.started = time.monotonic()
+        paused_seconds = 0.0
+        self.child = subprocess.Popen(self.arguments, process_group=0)
+        process_group = self.child.pid
+        with State() as state:
+            state.set_job(self.key, process_group=process_group, run_seconds=0.0)
+        reserved = reservation
+        paused_since = None
+        published_run_seconds = 0.0
+        while True:
+            if self.forwarded_signal is not None:
+                signal_group(process_group, signal.SIGCONT)
+                signal_group(process_group, self.forwarded_signal)
+                self.forwarded_signal = None
+                paused_since = None
+            code = self.child.poll()
+            if code is not None:
+                self.finish(code)
+                return code
+            if paused_since is None:
+                usage = group_memory(process_group)
+                self.peak = max(self.peak, usage)
+                if usage > reserved:
+                    wanted = max(int(usage * MARGIN), reserved + GROW_MINIMUM)
+                    grown, victim = self.try_grow(wanted)
+                    if grown:
+                        log_event('grow', self.key, reserved, wanted, self.object_path)
+                        reserved = wanted
+                    else:
+                        signal_group(process_group, signal.SIGSTOP)
+                        paused_since = time.monotonic()
+                        log_event('pause', self.key, usage, wanted, self.object_path)
+                time.sleep(POLL_SECONDS)
+            else:
+                time.sleep(WAIT_SECONDS)
+                wanted = max(int(self.peak * MARGIN), reserved + GROW_MINIMUM)
+                grown, victim = self.try_grow(wanted)
+                if grown:
+                    paused_seconds += time.monotonic() - paused_since
+                    paused_since = None
+                    reserved = wanted
+                    signal_group(process_group, signal.SIGCONT)
+                    log_event('resume', self.key, reserved, self.object_path)
+                elif victim:
+                    signal_group(process_group, signal.SIGKILL)
+                    signal_group(process_group, signal.SIGCONT)
+                    self.child.wait()
+                    with State() as state:
+                        state.set_job(self.key, state='waiting', since=time.time())
+                    log_event('kill', self.key, self.peak, self.object_path)
+                    return 'killed'
+            run_seconds = time.monotonic() - self.started - paused_seconds
+            if paused_since is None and run_seconds - published_run_seconds >= 1.0:
+                with State() as state:
+                    if self.key in state.ledger:
+                        state.set_job(self.key, run_seconds=run_seconds)
+                published_run_seconds = run_seconds
+
+    def finish(self, code):
+        with State() as state:
+            state.remove_job(self.key)
+            if code == 0 and self.history_key:
+                entry = state.load_history().setdefault(self.history_key, {'peaks': []})
+                entry['peaks'] = (entry['peaks'] + [self.peak])[-HISTORY_DEPTH:]
+        log_event('finish', self.key, self.peak, '%.1f' % (time.monotonic() - self.started),
+                  code, self.object_path)
+
+    def handle_signal(self, number, frame):
+        if self.child is None:
+            self.release()
+            os._exit(128 + number)
+        self.forwarded_signal = number
+
+    def release(self):
+        try:
+            with State() as state:
+                state.remove_job(self.key)
+        except Exception:
+            pass
+
+
+def report():
+    events = []
+    try:
+        with open(EVENTS_PATH) as file:
+            events = [line.rstrip('\n').split('\t') for line in file]
+    except OSError:
+        pass
+    counts = {}
+    for event in events:
+        counts[event[1]] = counts.get(event[1], 0) + 1
+    print('events:', ', '.join(f'{name} {count}' for name, count in sorted(counts.items())))
+    finishes = sorted((int(e[3]), float(e[4]), e[6]) for e in events if e[1] == 'finish')
+    for peak, seconds, path in finishes[-15:][::-1]:
+        print(f'{peak / GB:6.2f} GB {seconds:7.1f} s  {path}')
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments == ['--report']:
+        report()
+        return 0
+    if not arguments:
+        print(__doc__, file=sys.stderr)
+        return 2
+    if os.environ.get('COMPILE_MEMORY_BUDGET') == 'off' or sys.version_info < (3, 11):
+        os.execvp(arguments[0], arguments)
+    launcher = None
+    try:
+        os.makedirs(STATE_DIRECTORY, exist_ok=True)
+        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+        launcher = Launcher(arguments)
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(number, launcher.handle_signal)
+        code = launcher.run()
+        return 128 - code if code < 0 else code
+    except Exception as error:
+        try:
+            log_event('fail-open', repr(error), ' '.join(arguments))
+        except Exception:
+            pass
+        if launcher is not None:
+            launcher.release()
+            if launcher.child is not None:
+                return launcher.child.wait()
+        os.execvp(arguments[0], arguments)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
