@@ -95,3 +95,16 @@ parallelism, never the build.
 - Memory is polled, so a compile can overshoot its reservation by one interval's growth.
   The 15% margin absorbs it.
 - The first build has no history and reserves conservatively.
+
+## Background
+
+Running out of memory at high `-j` is a long-standing problem, and the usual answers are static:
+
+- Ninja: a dynamic memory limit was proposed and closed without merging ([ninja#1354](https://github.com/ninja-build/ninja/pull/1354)); see also [ninja#1441](https://github.com/ninja-build/ninja/issues/1441).
+- CMake: [job pools](https://www.scivision.dev/cmake-ninja-job-pool-limited-memory/) cap the jobs per target, at a number fixed in advance.
+- LLVM: [`LLVM_RAM_PER_COMPILE_JOB`](https://github.com/llvm/llvm-project/blob/main/llvm/cmake/modules/HandleLLVMOptions.cmake) divides memory by a per-job figure at configure time ([llvm-dev thread](https://groups.google.com/g/llvm-dev/c/GVx5GafIH0k/m/qoT1jhSoCAAJ)), and builds that embed LLVM still hit it ([ROCm/TheRock#5684](https://github.com/ROCm/TheRock/issues/5684)).
+- Bazel: each action declares a resource estimate that the scheduler sums ([how it works](https://jmmv.dev/2019/12/bazel-local-resources.html)); the estimates can be far off ([Addressing Bazel OOMs](https://jmmv.dev/2023/03/addressing-bazel-ooms.html)).
+- Linkers: [ld-limiter](https://github.com/yugr/ld-limiter) caps concurrent links by count.
+- Cargo: [the same question for Rust](https://users.rust-lang.org/t/limiting-number-of-build-jobs-based-on-memory/127789).
+
+ramsched measures instead of estimating: reservations come from each file's own recorded peak, and running compiles are watched and paused rather than trusted.
