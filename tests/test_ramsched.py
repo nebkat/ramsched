@@ -117,6 +117,35 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(process.wait(), 0)
         self.assertTrue(os.path.exists(os.path.join(self.path, 'open.o')))
 
+    def test_fails_open_when_state_directory_is_shared(self):
+        state = os.path.join(self.path, 'state')
+        os.makedirs(state, mode=0o777)
+        os.chmod(state, 0o777)
+        process = self.start(10, 0.1, 'shared.o')
+        self.assertEqual(process.wait(), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.path, 'shared.o')))
+        self.assertFalse(os.path.exists(os.path.join(state, 'ledger.json')))
+
+    def test_never_kills_a_reused_process_group(self):
+        bystander = subprocess.Popen(['sleep', '30'], process_group=0)
+        try:
+            state = os.path.join(self.path, 'state')
+            os.makedirs(state, mode=0o700)
+            stale = {
+                str(bystander.pid): {
+                    'state': 'paused', 'reserved': 1 << 20, 'want': 1 << 20, 'since': 0,
+                    'launcher_start': 1, 'process_group': bystander.pid, 'group_start': 1,
+                },
+            }
+            with open(os.path.join(state, 'ledger.json'), 'w') as file:
+                json.dump(stale, file)
+            self.assertEqual(self.start(10, 0.1, 'reuse.o').wait(), 0)
+            self.assertIsNone(bystander.poll())
+            self.assertIn('pruned', [event[0] for event in self.events()])
+        finally:
+            bystander.kill()
+            bystander.wait()
+
     def test_passes_the_compiler_exit_code_through(self):
         command = [sys.executable, LAUNCHER, sys.executable, '-c', 'raise SystemExit(3)']
         self.assertEqual(subprocess.run(command, cwd=self.path, env=self.environment).returncode, 3)

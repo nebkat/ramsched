@@ -38,7 +38,7 @@ paused or were killed, and the heaviest files.
 | `RAMSCHED_RESERVE` | `4` | GB kept back when the budget is derived from RAM |
 | `RAMSCHED_DEFAULT` | `2` for C++, `0.5` otherwise | GB reserved for a command with no history |
 | `RAMSCHED_HISTORY` | `~/.cache/ramsched/history.json` | per-file peak history |
-| `RAMSCHED_DIR` | `/tmp/ramsched` | ledger of running compiles, shared by every build on the machine |
+| `RAMSCHED_DIR` | `$XDG_RUNTIME_DIR/ramsched`, else `/tmp/ramsched-<uid>` | ledger of running compiles, shared by all of the user's builds; must be private to the user |
 
 ## How it works
 
@@ -57,7 +57,9 @@ paused or were killed, and the heaviest files.
    so every checkout of a project shares one history.
 
 Launchers coordinate through a lock file; a dead launcher's compile is killed by the next
-one to take the lock. Any internal error runs the compiler directly, so a fault costs
+one to take the lock. The ledger directory must be owned by the user with mode 0700, and
+a process is only signalled if its start time matches the one recorded, so neither another
+user nor a reused pid can direct a kill. Any internal error runs the compiler directly, so a fault costs
 parallelism, never the build.
 
 ## Limits
