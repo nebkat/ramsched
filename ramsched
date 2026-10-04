@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""Memory-budgeted compiler launcher.
+"""Memory-aware compiler launcher.
 
 Usage as a prefix:  ramsched <compiler> <args...>
 Report:             ramsched --report
 
-Each compile reserves an estimate (recent peak + margin) from a machine-wide
-budget before it starts. While it runs its process group's memory is polled; at
-the reservation it grows the reservation if the budget allows, otherwise it is
-SIGSTOPped until budget frees up. If every holder of memory is paused, the one
-that has run the shortest is killed and requeued with a larger reservation.
+Each compile reserves an estimate (recent peak + margin) before it starts, and is
+admitted only while its reservation fits. Two limits can apply, separately or together:
+
+  budget    compiles hold at most this much in total
+  headroom  this much memory stays available on the machine, whoever uses the rest
+
+While a compile runs its memory is polled. At its reservation it grows if the limits
+allow, otherwise it is SIGSTOPped until they do. If available memory falls below the
+pause level, or macOS reports memory pressure (warn), all but the oldest compile are paused;
+below the kill level, or at critical pressure, the newest are killed and requeued. If every compile holding memory is paused, the one that has run the
+shortest is killed and requeued with a larger reservation.
 
 Any internal failure falls back to running the compiler directly.
 
-Environment:
-  RAMSCHED_BUDGET   GB available to compiles, or "off" (default: RAM - reserve)
-  RAMSCHED_RESERVE  GB kept back when the budget is derived from RAM (default 4)
-  RAMSCHED_DIR      ledger directory, live builds only (default $XDG_RUNTIME_DIR/ramsched,
-                    else /tmp/ramsched-<uid>); must be owned by the user and private
-  RAMSCHED_HISTORY  peak history file (default ~/.cache/ramsched/history.json)
-  RAMSCHED_DEFAULT  GB reserved for a command with no history (default 2 for C++, 0.5 otherwise)
+Environment (sizes in GB):
+  RAMSCHED              "off" runs the compiler directly
+  RAMSCHED_BUDGET       total compiles may reserve (default: no budget)
+  RAMSCHED_HEADROOM     memory kept available, or "off" (default: 10% of RAM)
+  RAMSCHED_PAUSE_BELOW  available memory below which compiles are paused (default: headroom / 2)
+  RAMSCHED_KILL_BELOW   available memory below which compiles are killed, or "off"
+                        (default: headroom / 4)
+  RAMSCHED_DEFAULT      reservation for a command with no history (default 2 for C++, 0.5 otherwise)
+  RAMSCHED_DIR          ledger directory, live builds only (default $XDG_RUNTIME_DIR/ramsched,
+                        else /tmp/ramsched-<uid>); must be owned by the user and private
+  RAMSCHED_HISTORY      peak history file (default ~/.cache/ramsched/history.json)
 """
 
 import ctypes
@@ -38,7 +48,10 @@ MARGIN = 1.15
 GROW_MINIMUM = 256 * MB
 POLL_SECONDS = 0.1
 WAIT_SECONDS = 0.2
+PUBLISH_SECONDS = 1.0
+PUBLISH_BYTES = 64 * MB
 PROTECT_AFTER_SECONDS = 30.0
+KILL_INTERVAL_SECONDS = 2.0
 LOCK_TIMEOUT_SECONDS = 10.0
 HISTORY_DEPTH = 3
 DEFAULT_ESTIMATE = {'c': 512 * MB, 'cpp': 2 * GB}
@@ -51,6 +64,8 @@ HISTORY_PATH = os.environ.get('RAMSCHED_HISTORY',
                               os.path.expanduser('~/.cache/ramsched/history.json'))
 LOCK_PATH = os.path.join(STATE_DIRECTORY, 'lock')
 EVENTS_PATH = os.path.join(STATE_DIRECTORY, 'events.log')
+
+HOLDING = ('running', 'paused')
 
 
 class LockTimeout(Exception):
@@ -71,12 +86,38 @@ def prepare_state_directory():
         raise UnsafeStateDirectory(f'{STATE_DIRECTORY} must be owned by uid {os.getuid()} with mode 0700')
 
 
-# --- platform memory measurement -------------------------------------------------
+# --- platform --------------------------------------------------------------------
 
 if sys.platform == 'darwin':
+    libc = ctypes.CDLL(None, use_errno=True)
     libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
     RUSAGE_INFO_V2 = 2
     PHYS_FOOTPRINT_OFFSET = 16 + 8 * 7  # uuid, then 7 uint64 fields precede phys_footprint
+    PROC_PIDTBSDINFO = 3
+    PROC_BSDINFO_SIZE = 136
+    START_OFFSET = 120  # pbi_start_tvsec, followed by pbi_start_tvusec
+    SZOMB = 5
+
+    def sysctl_integer(name, ctype):
+        value = ctype()
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        if libc.sysctlbyname(name.encode(), ctypes.byref(value), ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), f'sysctl {name}')
+        return value.value
+
+    def physical_memory():
+        return sysctl_integer('hw.memsize', ctypes.c_uint64)
+
+    def available_memory():
+        # The percentage memory_pressure(1) reports as "free". macOS keeps it up by
+        # compressing other processes, so it trails real allocations; kernel_pressure()
+        # covers what it misses.
+        return physical_memory() * sysctl_integer('kern.memorystatus_level', ctypes.c_int) // 100
+
+    KERNEL_PRESSURE = {2: 'pause', 4: 'kill'}  # DISPATCH_MEMORYPRESSURE_WARN, _CRITICAL
+
+    def kernel_pressure():
+        return KERNEL_PRESSURE.get(sysctl_integer('kern.memorystatus_vm_pressure_level', ctypes.c_int))
 
     def group_pids(process_group):
         buffer = (ctypes.c_int * 1024)()
@@ -88,15 +129,6 @@ if sys.platform == 'darwin':
         if libproc.proc_pid_rusage(pid, RUSAGE_INFO_V2, buffer) != 0:
             return 0
         return int.from_bytes(buffer.raw[PHYS_FOOTPRINT_OFFSET:PHYS_FOOTPRINT_OFFSET + 8], 'little')
-
-    def physical_memory():
-        return int(subprocess.check_output(['sysctl', '-n', 'hw.memsize']))
-
-    PROC_PIDTBSDINFO = 3
-    PROC_BSDINFO_SIZE = 136
-    SZOMB = 5
-
-    START_OFFSET = 120  # pbi_start_tvsec, followed by pbi_start_tvusec
 
     def bsd_info(pid):
         buffer = ctypes.create_string_buffer(PROC_BSDINFO_SIZE)
@@ -120,6 +152,50 @@ if sys.platform == 'darwin':
         return seconds * 1_000_000 + microseconds
 else:
     PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')
+
+    def read_text(path):
+        with open(path) as file:
+            return file.read().strip()
+
+    def cgroup_directories():
+        """The cgroup v2 directories this process sits in, innermost first."""
+        try:
+            relative = next(line[3:] for line in read_text('/proc/self/cgroup').splitlines()
+                            if line.startswith('0::'))
+        except (OSError, StopIteration):
+            return []
+        directories = []
+        while True:
+            directories.append(os.path.join('/sys/fs/cgroup', relative.lstrip('/')))
+            if relative in ('', '/'):
+                return directories
+            relative = os.path.dirname(relative)
+
+    def cgroup_limits():
+        """(limit, current) for every enclosing cgroup with a memory limit."""
+        limits = []
+        for directory in cgroup_directories():
+            try:
+                limit = read_text(os.path.join(directory, 'memory.max'))
+                if limit != 'max':
+                    limits.append((int(limit), int(read_text(os.path.join(directory, 'memory.current')))))
+            except (OSError, ValueError):
+                pass
+        return limits
+
+    def physical_memory():
+        total = os.sysconf('SC_PHYS_PAGES') * PAGE_SIZE
+        return min([total] + [limit for limit, _ in cgroup_limits()])
+
+    def kernel_pressure():
+        return None
+
+    def available_memory():
+        available = None
+        for line in read_text('/proc/meminfo').splitlines():
+            if line.startswith('MemAvailable:'):
+                available = int(line.split()[1]) * 1024
+        return min([available] + [limit - current for limit, current in cgroup_limits()])
 
     def descendants(pid):
         pids, pending = [], [pid]
@@ -172,28 +248,68 @@ else:
         fields = stat_fields(pid)
         return int(fields[19]) if fields else None
 
-    def physical_memory():
-        total = os.sysconf('SC_PHYS_PAGES') * PAGE_SIZE
+
+if os.environ.get('RAMSCHED_TEST_AVAILABLE'):
+    # Tests drive available memory and kernel pressure from files instead of the machine.
+    def available_memory():
+        with open(os.environ['RAMSCHED_TEST_AVAILABLE']) as file:
+            return int(float(file.read()) * GB)
+
+    def kernel_pressure():
         try:
-            with open('/sys/fs/cgroup/memory.max') as limit:
-                value = limit.read().strip()
-            if value != 'max':
-                total = min(total, int(value))
-        except OSError:
-            pass
-        return total
+            with open(os.environ['RAMSCHED_TEST_AVAILABLE'] + '.pressure') as file:
+                return file.read().strip() or None
+        except FileNotFoundError:
+            return None
 
 
 def group_memory(process_group):
     return sum(process_memory(pid) for pid in group_pids(process_group))
 
 
-def budget_bytes():
-    configured = os.environ.get('RAMSCHED_BUDGET')
-    if configured:
-        return int(float(configured) * GB)
-    reserve = float(os.environ.get('RAMSCHED_RESERVE', '4'))
-    return physical_memory() - int(reserve * GB)
+def alive(pid, expected_start):
+    """Whether pid is still the process that was recorded, not a reuse of its number."""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    if zombie(pid):
+        return False
+    return expected_start is None or start_time(pid) == expected_start
+
+
+def signal_group(process_group, number):
+    try:
+        os.killpg(process_group, number)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+# --- limits ----------------------------------------------------------------------
+
+def size_setting(name, default):
+    """A size in GB from the environment; "off" gives None."""
+    value = os.environ.get(name, '')
+    if value == '':
+        return default
+    if value == 'off':
+        return None
+    return int(float(value) * GB)
+
+
+class Limits:
+    def __init__(self):
+        total = physical_memory()
+        self.budget = size_setting('RAMSCHED_BUDGET', None)
+        self.headroom = size_setting('RAMSCHED_HEADROOM', total // 10)
+        if self.budget is None and self.headroom is None:
+            self.budget = total
+        headroom = self.headroom or 0
+        self.pause_below = size_setting('RAMSCHED_PAUSE_BELOW', headroom // 2) if self.headroom else None
+        if self.headroom and self.pause_below is None:
+            self.pause_below = 0
+        self.kill_below = size_setting('RAMSCHED_KILL_BELOW', headroom // 4) if self.headroom else None
+        self.hysteresis = max(256 * MB, headroom // 10)
 
 
 # --- shared state ----------------------------------------------------------------
@@ -214,6 +330,7 @@ class State:
                     raise LockTimeout()
                 time.sleep(0.01)
         self.ledger = read_json(LEDGER_PATH, {})
+        self.jobs = self.ledger.setdefault('jobs', {})
         self.ledger_changed = False
         self.history = None
         return self
@@ -234,15 +351,15 @@ class State:
             self.lock_file.close()
 
     def set_job(self, key, **fields):
-        self.ledger.setdefault(key, {}).update(fields)
+        self.jobs.setdefault(key, {}).update(fields)
         self.ledger_changed = True
 
     def remove_job(self, key):
-        if self.ledger.pop(key, None) is not None:
+        if self.jobs.pop(key, None) is not None:
             self.ledger_changed = True
 
     def prune_dead(self):
-        for key, job in list(self.ledger.items()):
+        for key, job in list(self.jobs.items()):
             if alive(int(key), job.get('launcher_start')):
                 continue
             process_group = job.get('process_group')
@@ -252,9 +369,34 @@ class State:
             self.remove_job(key)
             log_event('pruned', key, job.get('object', '?'))
 
-    def held(self, excluding=None):
-        return sum(job['reserved'] for key, job in self.ledger.items()
-                   if key != excluding and job['state'] in ('running', 'paused'))
+    def holders(self, excluding=None):
+        return {key: job for key, job in self.jobs.items()
+                if key != excluding and job['state'] in HOLDING}
+
+    def anchor(self):
+        """The longest-admitted compile holding memory: never paused or killed for pressure."""
+        holders = self.holders()
+        return min(holders, key=lambda key: holders[key]['admitted']) if holders else None
+
+    def fits(self, limits, key, wanted, used, available, margin=0):
+        """Whether job key may hold wanted bytes, of which it already uses used."""
+        others = self.holders(excluding=key)
+        if not others:
+            return True
+        pending = sum(max(0, job['want'] - job['reserved']) for job in others.values()
+                      if job['state'] == 'paused')
+        waiting = sorted((job['since'], other) for other, job in self.jobs.items()
+                         if job['state'] == 'waiting' and other != key)
+        if waiting and time.time() - waiting[0][0] > PROTECT_AFTER_SECONDS:
+            pending += self.jobs[waiting[0][1]]['reserved']
+        if limits.budget is not None:
+            if sum(job['reserved'] for job in others.values()) + pending + wanted > limits.budget:
+                return False
+        if limits.headroom is not None:
+            unconsumed = sum(max(0, job['reserved'] - job.get('used', 0)) for job in others.values())
+            if available - unconsumed - pending - max(0, wanted - used) < limits.headroom + margin:
+                return False
+        return True
 
 
 def read_json(path, default):
@@ -270,26 +412,6 @@ def write_json(path, value):
     with open(temporary, 'w') as file:
         json.dump(value, file)
     os.replace(temporary, path)
-
-
-def alive(pid, expected_start):
-    """Whether pid is still the process that was recorded, not a reuse of its number."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return False
-    if zombie(pid):
-        return False
-    return expected_start is None or start_time(pid) == expected_start
-
-
-def signal_group(process_group, number):
-    try:
-        os.killpg(process_group, number)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 def log_event(*fields):
@@ -333,10 +455,15 @@ def estimate(history, key, arguments):
                       if directory and path.startswith(directory + '/') and entry.get('peaks'))
     if siblings:
         return int(siblings[len(siblings) // 2] * MARGIN)
-    configured = os.environ.get('RAMSCHED_DEFAULT')
+    configured = size_setting('RAMSCHED_DEFAULT', None)
     if configured:
-        return int(float(configured) * GB)
+        return configured
     return DEFAULT_ESTIMATE[language(arguments)]
+
+
+class Killed(Exception):
+    def __init__(self, reservation):
+        self.reservation = reservation
 
 
 class Launcher:
@@ -345,142 +472,179 @@ class Launcher:
         self.key = str(os.getpid())
         self.object_path = output_path(arguments)
         self.history_key = history_key(self.object_path, arguments)
-        self.budget = budget_bytes()
+        self.name = self.object_path or self.history_key
+        self.limits = Limits()
         self.child = None
+        self.process_group = None
         self.peak = 0
         self.forwarded_signal = None
-        self.started = None
-
-    def admissible(self, state, reservation):
-        held = state.held()
-        if held == 0:
-            return True
-        pending_growth = sum(job['want'] - job['reserved'] for job in state.ledger.values()
-                             if job['state'] == 'paused')
-        committed = held + pending_growth
-        waiting = sorted((job['since'], key) for key, job in state.ledger.items()
-                         if job['state'] == 'waiting')
-        if waiting:
-            oldest_since, oldest_key = waiting[0]
-            if oldest_key != self.key and time.time() - oldest_since > PROTECT_AFTER_SECONDS:
-                committed += state.ledger[oldest_key]['reserved']
-        return committed + reservation <= self.budget
-
-    def acquire(self, reservation):
-        with State() as state:
-            state.set_job(self.key, state='waiting', reserved=reservation, want=reservation,
-                          since=time.time(), object=self.object_path or self.history_key,
-                          launcher_start=start_time(os.getpid()))
-        waited = False
-        while True:
-            with State() as state:
-                state.prune_dead()
-                if self.admissible(state, reservation):
-                    state.set_job(self.key, state='running', reserved=reservation, want=reservation)
-                    break
-            waited = True
-            time.sleep(WAIT_SECONDS)
-        log_event('admit', self.key, reservation, 'waited' if waited else 'immediate', self.object_path)
-
-    def try_grow(self, wanted):
-        with State() as state:
-            state.prune_dead()
-            job = state.ledger[self.key]
-            others = state.held(excluding=self.key)
-            if others + wanted <= self.budget or others == 0:
-                state.set_job(self.key, state='running', reserved=wanted, want=wanted)
-                return True, None
-            if job['state'] != 'paused':
-                state.set_job(self.key, state='paused', want=wanted, paused_at=time.time())
-            running = [key for key, other in state.ledger.items() if other['state'] == 'running']
-            if running:
-                return False, None
-            paused = sorted((other['run_seconds'], key) for key, other in state.ledger.items()
-                            if other['state'] == 'paused')
-            return False, paused[0][1] == self.key
 
     def run(self):
         with State() as state:
             reservation = estimate(state.load_history(), self.history_key, self.arguments)
+            state.set_job(self.key, state='waiting', reserved=reservation, want=reservation,
+                          used=0, since=time.time(), object=self.name,
+                          launcher_start=start_time(os.getpid()))
         while True:
             self.acquire(reservation)
-            outcome = self.run_child(reservation)
-            if outcome != 'killed':
-                return outcome
-            reservation = int(max(self.peak, reservation) * 1.5)
-            log_event('requeue', self.key, reservation, self.object_path)
+            try:
+                return self.run_child(reservation)
+            except Killed as killed:
+                reservation = killed.reservation
+                log_event('requeue', self.key, reservation, self.name)
+
+    def acquire(self, reservation):
+        waited = False
+        while True:
+            available = available_memory()
+            with State() as state:
+                state.prune_dead()
+                if state.fits(self.limits, self.key, reservation, 0, available):
+                    state.set_job(self.key, state='running', reserved=reservation, want=reservation,
+                                  used=0, admitted=time.time())
+                    break
+            waited = True
+            time.sleep(WAIT_SECONDS)
+        log_event('admit', self.key, reservation, 'waited' if waited else 'immediate', self.name)
 
     def run_child(self, reservation):
-        self.started = time.monotonic()
+        started = time.monotonic()
         paused_seconds = 0.0
         self.child = subprocess.Popen(self.arguments, process_group=0)
-        process_group = self.child.pid
+        self.process_group = self.child.pid
         with State() as state:
-            state.set_job(self.key, process_group=process_group, run_seconds=0.0,
-                          group_start=start_time(process_group))
+            state.set_job(self.key, process_group=self.process_group, run_seconds=0.0,
+                          group_start=start_time(self.process_group))
         reserved = reservation
-        paused_since = None
-        published_run_seconds = 0.0
+        paused = None  # (since, reason) while SIGSTOPped
+        usage = 0
+        published = (0.0, 0)
         while True:
             if self.forwarded_signal is not None:
-                signal_group(process_group, signal.SIGCONT)
-                signal_group(process_group, self.forwarded_signal)
+                signal_group(self.process_group, signal.SIGCONT)
+                signal_group(self.process_group, self.forwarded_signal)
                 self.forwarded_signal = None
-                paused_since = None
+                paused = None
             code = self.child.poll()
             if code is not None:
-                self.finish(code)
+                self.finish(code, time.monotonic() - started)
                 return code
-            if paused_since is None:
-                usage = group_memory(process_group)
+            available = available_memory()
+            if paused is None:
+                usage = group_memory(self.process_group)
                 self.peak = max(self.peak, usage)
-                if usage > reserved:
+                reason = self.pressure(available)
+                if reason == 'kill':
+                    self.kill(reserved)
+                if reason is not None and self.pause_for_pressure():
+                    paused = (time.monotonic(), 'pressure')
+                    log_event('pause', self.key, usage, reserved, self.name, 'pressure')
+                elif usage > reserved:
                     wanted = max(int(usage * MARGIN), reserved + GROW_MINIMUM)
-                    grown, victim = self.try_grow(wanted)
-                    if grown:
-                        log_event('grow', self.key, reserved, wanted, self.object_path)
+                    if self.grow(wanted, usage, available):
+                        log_event('grow', self.key, reserved, wanted, self.name)
                         reserved = wanted
                     else:
-                        signal_group(process_group, signal.SIGSTOP)
-                        paused_since = time.monotonic()
-                        log_event('pause', self.key, usage, wanted, self.object_path)
+                        signal_group(self.process_group, signal.SIGSTOP)
+                        paused = (time.monotonic(), 'growth')
+                        log_event('pause', self.key, usage, wanted, self.name, 'growth')
                 time.sleep(POLL_SECONDS)
             else:
                 time.sleep(WAIT_SECONDS)
-                wanted = max(int(self.peak * MARGIN), reserved + GROW_MINIMUM)
-                grown, victim = self.try_grow(wanted)
-                if grown:
-                    paused_seconds += time.monotonic() - paused_since
-                    paused_since = None
+                since, reason = paused
+                if self.pressure(available) == 'kill':
+                    self.kill(reserved)
+                wanted = reserved if reason == 'pressure' else max(int(self.peak * MARGIN),
+                                                                   reserved + GROW_MINIMUM)
+                resumed, victim = self.try_resume(wanted, usage, available)
+                if resumed:
+                    paused_seconds += time.monotonic() - since
+                    paused = None
                     reserved = wanted
-                    signal_group(process_group, signal.SIGCONT)
-                    log_event('resume', self.key, reserved, self.object_path)
+                    signal_group(self.process_group, signal.SIGCONT)
+                    log_event('resume', self.key, reserved, self.name)
                 elif victim:
-                    signal_group(process_group, signal.SIGKILL)
-                    signal_group(process_group, signal.SIGCONT)
-                    self.child.wait()
-                    with State() as state:
-                        state.set_job(self.key, state='waiting', since=time.time())
-                    log_event('kill', self.key, self.peak, self.object_path)
-                    return 'killed'
-            run_seconds = time.monotonic() - self.started - paused_seconds
-            if paused_since is None and run_seconds - published_run_seconds >= 1.0:
+                    self.kill(int(max(self.peak, reserved) * 1.5), deadlock=True)
+            run_seconds = time.monotonic() - started - paused_seconds
+            if paused is None and (run_seconds - published[0] >= PUBLISH_SECONDS
+                                   or abs(usage - published[1]) >= PUBLISH_BYTES):
                 with State() as state:
-                    if self.key in state.ledger:
-                        state.set_job(self.key, run_seconds=run_seconds)
-                published_run_seconds = run_seconds
+                    if self.key in state.jobs:
+                        state.set_job(self.key, run_seconds=run_seconds, used=usage)
+                published = (run_seconds, usage)
 
-    def finish(self, code):
+    def pressure(self, available):
+        limits = self.limits
+        if limits.headroom is None:
+            return None
+        kernel = kernel_pressure()
+        if limits.kill_below is not None and (available < limits.kill_below or kernel == 'kill'):
+            return 'kill'
+        if available < limits.pause_below or kernel is not None:
+            return 'pause'
+        return None
+
+    def pause_for_pressure(self):
+        with State() as state:
+            if state.anchor() == self.key:
+                return False
+            state.set_job(self.key, state='paused', paused_at=time.time(), reason='pressure')
+        signal_group(self.process_group, signal.SIGSTOP)
+        return True
+
+    def grow(self, wanted, usage, available):
+        with State() as state:
+            state.prune_dead()
+            if state.fits(self.limits, self.key, wanted, usage, available):
+                state.set_job(self.key, state='running', reserved=wanted, want=wanted, used=usage)
+                return True
+            state.set_job(self.key, state='paused', want=wanted, paused_at=time.time(), reason='growth')
+            return False
+
+    def try_resume(self, wanted, usage, available):
+        """(resumed, should this job be killed to break a deadlock)."""
+        with State() as state:
+            state.prune_dead()
+            job = state.jobs[self.key]
+            anchor = state.anchor() == self.key
+            if (anchor and job.get('reason') == 'pressure') or state.fits(
+                    self.limits, self.key, wanted, usage, available, margin=self.limits.hysteresis):
+                state.set_job(self.key, state='running', reserved=wanted, want=wanted, reason=None)
+                return True, False
+            if any(other['state'] == 'running' for other in state.jobs.values()):
+                return False, False
+            paused = sorted((other.get('run_seconds', 0), key) for key, other in state.jobs.items()
+                            if other['state'] == 'paused')
+            return False, paused[0][1] == self.key
+
+    def kill(self, reservation, deadlock=False):
+        """Kill this compile and requeue it, if it is the one to go. Raises Killed."""
+        with State() as state:
+            if not deadlock:
+                holders = state.holders()
+                newest = max(holders, key=lambda key: holders[key]['admitted'])
+                if (newest != self.key or state.anchor() == self.key
+                        or time.time() - state.ledger.get('last_kill', 0) < KILL_INTERVAL_SECONDS):
+                    return
+                state.ledger['last_kill'] = time.time()
+            state.set_job(self.key, state='waiting', reserved=reservation, want=reservation,
+                          used=0, since=time.time(), reason=None)
+        signal_group(self.process_group, signal.SIGKILL)
+        signal_group(self.process_group, signal.SIGCONT)
+        self.child.wait()
+        log_event('kill', self.key, self.peak, self.name, 'deadlock' if deadlock else 'pressure')
+        raise Killed(reservation)
+
+    def finish(self, code, seconds):
         with State() as state:
             state.remove_job(self.key)
             if code == 0 and self.history_key:
                 entry = state.load_history().setdefault(self.history_key, {'peaks': []})
                 entry['peaks'] = (entry['peaks'] + [self.peak])[-HISTORY_DEPTH:]
-        log_event('finish', self.key, self.peak, '%.1f' % (time.monotonic() - self.started),
-                  code, self.object_path)
+        log_event('finish', self.key, self.peak, '%.1f' % seconds, code, self.name)
 
     def handle_signal(self, number, frame):
-        if self.child is None:
+        if self.child is None or self.child.returncode is not None:
             self.release()
             os._exit(128 + number)
         self.forwarded_signal = number
@@ -502,7 +666,8 @@ def report():
         pass
     counts = {}
     for event in events:
-        counts[event[1]] = counts.get(event[1], 0) + 1
+        name = event[1] + (f' ({event[-1]})' if event[1] in ('pause', 'kill') else '')
+        counts[name] = counts.get(name, 0) + 1
     print('events:', ', '.join(f'{name} {count}' for name, count in sorted(counts.items())))
     finishes = sorted((int(e[3]), float(e[4]), e[6]) for e in events if e[1] == 'finish')
     for peak, seconds, path in finishes[-15:][::-1]:
@@ -517,7 +682,7 @@ def main():
     if not arguments:
         print(__doc__, file=sys.stderr)
         return 2
-    if os.environ.get('RAMSCHED_BUDGET') == 'off' or sys.version_info < (3, 11):
+    if os.environ.get('RAMSCHED') == 'off' or sys.version_info < (3, 11):
         os.execvp(arguments[0], arguments)
     launcher = None
     try:

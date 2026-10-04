@@ -6,10 +6,14 @@ import sys
 import tempfile
 import time
 import unittest
+from importlib.machinery import SourceFileLoader
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAUNCHER = os.path.join(ROOT, 'ramsched')
 FAKE_COMPILER = os.path.join(ROOT, 'tests', 'fake_compiler.py')
+ramsched = SourceFileLoader('ramsched', LAUNCHER).load_module()
+GB = 1 << 30
+
 
 
 class LauncherTest(unittest.TestCase):
@@ -21,6 +25,7 @@ class LauncherTest(unittest.TestCase):
             RAMSCHED_DIR=os.path.join(self.path, 'state'),
             RAMSCHED_HISTORY=os.path.join(self.path, 'state', 'history.json'),
             RAMSCHED_BUDGET='0.5',
+            RAMSCHED_HEADROOM='off',
             RAMSCHED_DEFAULT='0.2',
         )
 
@@ -38,7 +43,7 @@ class LauncherTest(unittest.TestCase):
 
     def ledger(self):
         with open(os.path.join(self.path, 'state', 'ledger.json')) as file:
-            return json.load(file)
+            return json.load(file)['jobs']
 
     def wait_for_event(self, name, timeout=20):
         deadline = time.monotonic() + timeout
@@ -107,7 +112,7 @@ class LauncherTest(unittest.TestCase):
             os.killpg(orphan_group, 0)
 
     def test_off_passes_straight_through(self):
-        self.assertEqual(self.start(10, 0.1, 'off.o', RAMSCHED_BUDGET='off').wait(), 0)
+        self.assertEqual(self.start(10, 0.1, 'off.o', RAMSCHED='off').wait(), 0)
         self.assertFalse(os.path.exists(os.path.join(self.path, 'state')))
 
     def test_fails_open_when_state_is_unusable(self):
@@ -131,12 +136,12 @@ class LauncherTest(unittest.TestCase):
         try:
             state = os.path.join(self.path, 'state')
             os.makedirs(state, mode=0o700)
-            stale = {
+            stale = {'jobs': {
                 str(bystander.pid): {
-                    'state': 'paused', 'reserved': 1 << 20, 'want': 1 << 20, 'since': 0,
+                    'state': 'paused', 'reserved': 1 << 20, 'want': 1 << 20, 'since': 0, 'admitted': 0,
                     'launcher_start': 1, 'process_group': bystander.pid, 'group_start': 1,
                 },
-            }
+            }}
             with open(os.path.join(state, 'ledger.json'), 'w') as file:
                 json.dump(stale, file)
             self.assertEqual(self.start(10, 0.1, 'reuse.o').wait(), 0)
@@ -145,6 +150,120 @@ class LauncherTest(unittest.TestCase):
         finally:
             bystander.kill()
             bystander.wait()
+
+    def headroom_environment(self, available, headroom, pause_below, kill_below):
+        """Available memory is read from a file the test controls."""
+        self.available_file = os.path.join(self.path, 'available')
+        self.set_available(available)
+        return dict(
+            RAMSCHED_TEST_AVAILABLE=self.available_file,
+            RAMSCHED_BUDGET='',
+            RAMSCHED_HEADROOM=str(headroom),
+            RAMSCHED_PAUSE_BELOW=str(pause_below) if pause_below else 'off',
+            RAMSCHED_KILL_BELOW=str(kill_below) if kill_below else 'off',
+        )
+
+    def set_available(self, gigabytes):
+        with open(self.available_file + '.new', 'w') as file:
+            file.write(str(gigabytes))
+        os.replace(self.available_file + '.new', self.available_file)
+
+    def test_headroom_holds_back_what_does_not_fit(self):
+        environment = self.headroom_environment(10, 9, None, None)
+        processes = [self.start(50, 1.5, f'room{index}.o', RAMSCHED_DEFAULT='0.4', **environment)
+                     for index in range(4)]
+        for process in processes:
+            self.assertEqual(process.wait(), 0)
+        admits = [event for event in self.events() if event[0] == 'admit']
+        self.assertEqual([event[3] for event in admits].count('immediate'), 2)
+
+    def test_headroom_counts_reservations_not_yet_used(self):
+        environment = self.headroom_environment(10, 9, None, None)
+        first = self.start(10, 3, 'unused1.o', RAMSCHED_DEFAULT='0.8', **environment)
+        self.wait_for_event('admit')
+        second = self.start(10, 0.5, 'unused2.o', RAMSCHED_DEFAULT='0.8', **environment)
+        time.sleep(1.5)
+        self.assertEqual(len([event for event in self.events() if event[0] == 'admit']), 1)
+        self.assertEqual(first.wait(), 0)
+        self.assertEqual(second.wait(), 0)
+
+    def test_pressure_pauses_all_but_the_oldest(self):
+        environment = self.headroom_environment(10, 4, 3, None)
+        first = self.start(50, 6, 'calm1.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(0.5)
+        second = self.start(50, 6, 'calm2.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(1)
+        self.set_available(2.5)
+        self.wait_for_event('pause')
+        time.sleep(1)
+        self.assertEqual(self.ledger()[str(first.pid)]['state'], 'running')
+        self.set_available(10)
+        self.assertEqual(first.wait(), 0)
+        self.assertEqual(second.wait(), 0)
+        pauses = [event for event in self.events() if event[0] == 'pause']
+        self.assertEqual([(event[1], event[-1]) for event in pauses], [(str(second.pid), 'pressure')])
+        self.assertIn('resume', [event[0] for event in self.events()])
+
+    def test_pressure_kills_the_newest_and_requeues_it(self):
+        environment = self.headroom_environment(10, 4, 3, 2)
+        first = self.start(50, 6, 'kill1.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(0.5)
+        second = self.start(50, 6, 'kill2.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(0.5)
+        third = self.start(50, 6, 'kill3.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(1)
+        self.set_available(1.5)
+        self.wait_for_event('kill')
+        self.set_available(10)
+        for process in (first, second, third):
+            self.assertEqual(process.wait(), 0)
+        kills = [event for event in self.events() if event[0] == 'kill']
+        self.assertEqual([(event[1], event[-1]) for event in kills], [(str(third.pid), 'pressure')])
+        self.assertIn('requeue', [event[0] for event in self.events()])
+
+    def test_kernel_pressure_pauses_and_critical_kills(self):
+        environment = self.headroom_environment(10, 4, 3, 2)
+        first = self.start(50, 6, 'kernel1.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(0.5)
+        second = self.start(50, 6, 'kernel2.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(0.5)
+        third = self.start(50, 6, 'kernel3.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(1)
+        pressure = self.available_file + '.pressure'
+        with open(pressure, 'w') as file:
+            file.write('pause')
+        self.wait_for_event('pause')
+        with open(pressure, 'w') as file:
+            file.write('kill')
+        self.wait_for_event('kill')
+        os.remove(pressure)
+        for process in (first, second, third):
+            self.assertEqual(process.wait(), 0)
+        events = self.events()
+        self.assertNotIn(str(first.pid), [event[1] for event in events if event[0] in ('pause', 'kill')])
+        self.assertEqual([event[1] for event in events if event[0] == 'kill'], [str(third.pid)])
+
+    def test_a_lone_compile_is_never_paused_for_pressure(self):
+        environment = self.headroom_environment(1, 4, 3, 2)
+        self.assertEqual(self.start(50, 1.5, 'alone.o', RAMSCHED_DEFAULT='0.2', **environment).wait(), 0)
+        self.assertFalse([event for event in self.events() if event[0] in ('pause', 'kill')])
+
+    @unittest.skipUnless(os.environ.get('RAMSCHED_REAL_PRESSURE'), 'set RAMSCHED_REAL_PRESSURE=1')
+    def test_real_memory_pressure_pauses(self):
+        """A real program eating memory; depends on the machine, so not run in CI."""
+        available = ramsched.available_memory() / GB
+        environment = dict(RAMSCHED_BUDGET='', RAMSCHED_HEADROOM=str(available - 0.6),
+                           RAMSCHED_PAUSE_BELOW=str(available - 1.0), RAMSCHED_KILL_BELOW='off')
+        first = self.start(200, 8, 'real1.o', RAMSCHED_DEFAULT='0.25', **environment)
+        time.sleep(0.5)
+        second = self.start(200, 8, 'real2.o', RAMSCHED_DEFAULT='0.25', **environment)
+        time.sleep(1.5)
+        hog = subprocess.Popen([sys.executable, FAKE_COMPILER, '2500', '1.5', '4',
+                                '-o', os.path.join(self.path, 'hog.o')])
+        self.wait_for_event('pause')
+        hog.wait()
+        self.assertEqual(first.wait(), 0)
+        self.assertEqual(second.wait(), 0)
 
     def test_passes_the_compiler_exit_code_through(self):
         command = [sys.executable, LAUNCHER, sys.executable, '-c', 'raise SystemExit(3)']
