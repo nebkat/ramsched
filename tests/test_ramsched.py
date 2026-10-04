@@ -265,6 +265,20 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual(first.wait(), 0)
         self.assertEqual(second.wait(), 0)
 
+    def test_sixty_four_jobs_share_the_lock(self):
+        processes = [self.start(30, 1, f'stress{index}.o', RAMSCHED_BUDGET='1', RAMSCHED_DEFAULT='0.1')
+                     for index in range(64)]
+        self.assertEqual([process.wait() for process in processes], [0] * 64)
+        events = self.events()
+        self.assertEqual(sum(event[0] == 'finish' for event in events), 64)
+        self.assertNotIn('fail-open', [event[0] for event in events])
+        self.assertEqual(self.ledger(), {})
+        running, most = 0, 0
+        for event in events:
+            running += {'admit': 1, 'finish': -1}.get(event[0], 0)
+            most = max(most, running)
+        self.assertLessEqual(most, 10)
+
     def test_passes_the_compiler_exit_code_through(self):
         command = [sys.executable, LAUNCHER, sys.executable, '-c', 'raise SystemExit(3)']
         self.assertEqual(subprocess.run(command, cwd=self.path, env=self.environment).returncode, 3)
