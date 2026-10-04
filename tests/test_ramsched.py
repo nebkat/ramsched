@@ -8,7 +8,7 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LAUNCHER = os.path.join(ROOT, 'compile-memory')
+LAUNCHER = os.path.join(ROOT, 'ramsched')
 FAKE_COMPILER = os.path.join(ROOT, 'tests', 'fake_compiler.py')
 
 
@@ -18,10 +18,10 @@ class LauncherTest(unittest.TestCase):
         self.path = self.directory.name
         self.environment = dict(
             os.environ,
-            COMPILE_MEMORY_DIR=os.path.join(self.path, 'state'),
-            COMPILE_MEMORY_HISTORY=os.path.join(self.path, 'state', 'history.json'),
-            COMPILE_MEMORY_BUDGET='0.5',
-            COMPILE_MEMORY_DEFAULT='0.2',
+            RAMSCHED_DIR=os.path.join(self.path, 'state'),
+            RAMSCHED_HISTORY=os.path.join(self.path, 'state', 'history.json'),
+            RAMSCHED_BUDGET='0.5',
+            RAMSCHED_DEFAULT='0.2',
         )
 
     def tearDown(self):
@@ -107,13 +107,13 @@ class LauncherTest(unittest.TestCase):
             os.killpg(orphan_group, 0)
 
     def test_off_passes_straight_through(self):
-        self.assertEqual(self.start(10, 0.1, 'off.o', COMPILE_MEMORY_BUDGET='off').wait(), 0)
+        self.assertEqual(self.start(10, 0.1, 'off.o', RAMSCHED_BUDGET='off').wait(), 0)
         self.assertFalse(os.path.exists(os.path.join(self.path, 'state')))
 
     def test_fails_open_when_state_is_unusable(self):
         blocker = os.path.join(self.path, 'not-a-directory')
         open(blocker, 'w').close()
-        process = self.start(10, 0.1, 'open.o', COMPILE_MEMORY_DIR=blocker)
+        process = self.start(10, 0.1, 'open.o', RAMSCHED_DIR=blocker)
         self.assertEqual(process.wait(), 0)
         self.assertTrue(os.path.exists(os.path.join(self.path, 'open.o')))
 

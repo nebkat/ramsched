@@ -1,9 +1,9 @@
-# compile-memory
+# ramsched
 
 A compiler launcher that schedules parallel builds by memory, not just by job count.
 
 `-j` is a CPU limit. A build where most files need 300 MB but a few need 4 GB either runs
-slowly at a low `-j` or runs out of memory at a high one. `compile-memory` lets you keep
+slowly at a low `-j` or runs out of memory at a high one. `ramsched` lets you keep
 `-j` at the core count: each compile reserves memory from a machine-wide budget before it
 starts, and is paused rather than allowed to push the machine into swap or the OOM killer.
 
@@ -11,34 +11,34 @@ Unix only (Linux, macOS). Python 3.11+, standard library only, one file.
 
 ## Use
 
-Put `compile-memory` in front of the compiler. Anything that runs one process per compile
+Put `ramsched` in front of the compiler. Anything that runs one process per compile
 works:
 
 ```sh
 # ccache (only cache misses go through it)
-export CCACHE_PREFIX=/path/to/compile-memory
+export CCACHE_PREFIX=/path/to/ramsched
 
 # CMake
-cmake -DCMAKE_C_COMPILER_LAUNCHER=/path/to/compile-memory \
-      -DCMAKE_CXX_COMPILER_LAUNCHER=/path/to/compile-memory ...
+cmake -DCMAKE_C_COMPILER_LAUNCHER=/path/to/ramsched \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=/path/to/ramsched ...
 
 # Make, Meson, Autotools
-CC="/path/to/compile-memory gcc" CXX="/path/to/compile-memory g++" ...
+CC="/path/to/ramsched gcc" CXX="/path/to/ramsched g++" ...
 
 # Cargo
-export RUSTC_WRAPPER=/path/to/compile-memory
+export RUSTC_WRAPPER=/path/to/ramsched
 ```
 
-`compile-memory --report` summarises the last builds: how many compiles waited, grew,
+`ramsched --report` summarises the last builds: how many compiles waited, grew,
 paused or were killed, and the heaviest files.
 
 | Variable | Default | |
 |---|---|---|
-| `COMPILE_MEMORY_BUDGET` | RAM (or cgroup limit) minus reserve | GB available to compiles; `off` passes straight through |
-| `COMPILE_MEMORY_RESERVE` | `4` | GB kept back when the budget is derived from RAM |
-| `COMPILE_MEMORY_DEFAULT` | `2` for C++, `0.5` otherwise | GB reserved for a command with no history |
-| `COMPILE_MEMORY_HISTORY` | `~/.cache/compile-memory/history.json` | per-file peak history |
-| `COMPILE_MEMORY_DIR` | `/tmp/compile-memory` | ledger of running compiles, shared by every build on the machine |
+| `RAMSCHED_BUDGET` | RAM (or cgroup limit) minus reserve | GB available to compiles; `off` passes straight through |
+| `RAMSCHED_RESERVE` | `4` | GB kept back when the budget is derived from RAM |
+| `RAMSCHED_DEFAULT` | `2` for C++, `0.5` otherwise | GB reserved for a command with no history |
+| `RAMSCHED_HISTORY` | `~/.cache/ramsched/history.json` | per-file peak history |
+| `RAMSCHED_DIR` | `/tmp/ramsched` | ledger of running compiles, shared by every build on the machine |
 
 ## How it works
 

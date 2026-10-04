@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Memory-budgeted compiler launcher.
 
-Usage as a prefix:  compile-memory <compiler> <args...>
-Report:             compile-memory --report
+Usage as a prefix:  ramsched <compiler> <args...>
+Report:             ramsched --report
 
 Each compile reserves an estimate (recent peak + margin) from a machine-wide
 budget before it starts. While it runs its process group's memory is polled; at
@@ -13,11 +13,11 @@ that has run the shortest is killed and requeued with a larger reservation.
 Any internal failure falls back to running the compiler directly.
 
 Environment:
-  COMPILE_MEMORY_BUDGET   GB available to compiles, or "off" (default: RAM - reserve)
-  COMPILE_MEMORY_RESERVE  GB kept back when the budget is derived from RAM (default 4)
-  COMPILE_MEMORY_DIR      ledger directory, live builds only (default /tmp/compile-memory)
-  COMPILE_MEMORY_HISTORY  peak history file (default ~/.cache/compile-memory/history.json)
-  COMPILE_MEMORY_DEFAULT  GB reserved for a command with no history (default 2 for C++, 0.5 otherwise)
+  RAMSCHED_BUDGET   GB available to compiles, or "off" (default: RAM - reserve)
+  RAMSCHED_RESERVE  GB kept back when the budget is derived from RAM (default 4)
+  RAMSCHED_DIR      ledger directory, live builds only (default /tmp/ramsched)
+  RAMSCHED_HISTORY  peak history file (default ~/.cache/ramsched/history.json)
+  RAMSCHED_DEFAULT  GB reserved for a command with no history (default 2 for C++, 0.5 otherwise)
 """
 
 import ctypes
@@ -42,10 +42,10 @@ LOCK_TIMEOUT_SECONDS = 10.0
 HISTORY_DEPTH = 3
 DEFAULT_ESTIMATE = {'c': 512 * MB, 'cpp': 2 * GB}
 
-STATE_DIRECTORY = os.environ.get('COMPILE_MEMORY_DIR', '/tmp/compile-memory')
+STATE_DIRECTORY = os.environ.get('RAMSCHED_DIR', '/tmp/ramsched')
 LEDGER_PATH = os.path.join(STATE_DIRECTORY, 'ledger.json')
-HISTORY_PATH = os.environ.get('COMPILE_MEMORY_HISTORY',
-                              os.path.expanduser('~/.cache/compile-memory/history.json'))
+HISTORY_PATH = os.environ.get('RAMSCHED_HISTORY',
+                              os.path.expanduser('~/.cache/ramsched/history.json'))
 LOCK_PATH = os.path.join(STATE_DIRECTORY, 'lock')
 EVENTS_PATH = os.path.join(STATE_DIRECTORY, 'events.log')
 
@@ -148,10 +148,10 @@ def group_memory(process_group):
 
 
 def budget_bytes():
-    configured = os.environ.get('COMPILE_MEMORY_BUDGET')
+    configured = os.environ.get('RAMSCHED_BUDGET')
     if configured:
         return int(float(configured) * GB)
-    reserve = float(os.environ.get('COMPILE_MEMORY_RESERVE', '4'))
+    reserve = float(os.environ.get('RAMSCHED_RESERVE', '4'))
     return physical_memory() - int(reserve * GB)
 
 
@@ -289,7 +289,7 @@ def estimate(history, key, arguments):
                       if directory and path.startswith(directory + '/') and entry.get('peaks'))
     if siblings:
         return int(siblings[len(siblings) // 2] * MARGIN)
-    configured = os.environ.get('COMPILE_MEMORY_DEFAULT')
+    configured = os.environ.get('RAMSCHED_DEFAULT')
     if configured:
         return int(float(configured) * GB)
     return DEFAULT_ESTIMATE[language(arguments)]
@@ -471,7 +471,7 @@ def main():
     if not arguments:
         print(__doc__, file=sys.stderr)
         return 2
-    if os.environ.get('COMPILE_MEMORY_BUDGET') == 'off' or sys.version_info < (3, 11):
+    if os.environ.get('RAMSCHED_BUDGET') == 'off' or sys.version_info < (3, 11):
         os.execvp(arguments[0], arguments)
     launcher = None
     try:
