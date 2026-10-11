@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# ramsched-ninja — run ninja with its parallelism sized by memory where possible.
+#
+#     ramsched-ninja -C <build dir> [ninja arguments...]
+#
+# When the build directory compiles through ccache, every compile that misses the cache
+# goes through ramsched (CCACHE_PREFIX), which admits, grows and pauses compiles to keep
+# memory available, so ninja runs at its default parallelism (cores + 2).
+#
+# Otherwise ninja runs at a fixed -j$RAMSCHED_NINJA_JOBS (default 4). An explicit -j on
+# the command line is always respected. RAMSCHED=off skips ramsched.
+
+set -uo pipefail
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+ramsched="${RAMSCHED_PATH:-$here/ramsched}"
+
+build_dir=
+explicit_jobs=
+previous=
+for argument in "$@"; do
+    [ "$previous" = "-C" ] && build_dir=$argument
+    case "$argument" in -j*) explicit_jobs=1 ;; esac
+    previous=$argument
+done
+
+uses_ccache() {
+    [ -n "$build_dir" ] && grep -q 'ccache' "$build_dir/CMakeFiles/rules.ninja" 2>/dev/null
+}
+
+if [ "${RAMSCHED:-}" != off ] && [ -x "$ramsched" ] && uses_ccache; then
+    export CCACHE_PREFIX="$ramsched"
+    echo "ramsched-ninja: memory-scheduled by ramsched" >&2
+    exec ninja "$@"
+fi
+
+if [ -n "$explicit_jobs" ]; then
+    echo "ramsched-ninja: ramsched not applicable, using the -j given" >&2
+    exec ninja "$@"
+fi
+jobs="${RAMSCHED_NINJA_JOBS:-4}"
+echo "ramsched-ninja: ramsched not applicable, capping at -j$jobs" >&2
+exec ninja -j"$jobs" "$@"

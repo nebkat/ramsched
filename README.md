@@ -35,6 +35,11 @@ CC="/path/to/ramsched gcc" CXX="/path/to/ramsched g++" ...
 export RUSTC_WRAPPER=/path/to/ramsched
 ```
 
+For ninja builds that compile through ccache, `ramsched-ninja -C <build dir> ...` sets
+`CCACHE_PREFIX` and leaves ninja at its default parallelism; a build dir without ccache
+gets a fixed `-j$RAMSCHED_NINJA_JOBS` (default 4) instead. Link it onto `PATH` (it finds
+`ramsched` next to itself, or at `RAMSCHED_PATH`).
+
 `ramsched --report` summarises the last builds: how many compiles waited, grew,
 paused or were killed, and the heaviest files.
 
