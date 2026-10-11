@@ -11,10 +11,12 @@ admitted only while its reservation fits. Two limits can apply, separately or to
   headroom  this much memory stays available on the machine, whoever uses the rest
 
 While a compile runs its memory is polled. At its reservation it grows if the limits
-allow, otherwise it is SIGSTOPped until they do. If available memory falls below the
-pause level, or macOS reports memory pressure (warn), all but the oldest compile are paused;
-below the kill level, or at critical pressure, the newest are killed and requeued. If every compile holding memory is paused, the one that has run the
-shortest is killed and requeued with a larger reservation.
+allow, otherwise it is SIGSTOPped until they do. While macOS reports memory pressure (warn)
+no compile is admitted beside those already running. If available memory falls below the
+pause level, or the pressure is critical, all but the oldest compile are paused until
+neither holds; below the kill level, or at critical pressure, the newest are killed and
+requeued. If every compile holding memory is paused, the one that has run the shortest is
+killed and requeued with a larger reservation.
 
 Any internal failure falls back to running the compiler directly.
 
@@ -114,7 +116,7 @@ if sys.platform == 'darwin':
         # covers what it misses.
         return physical_memory() * sysctl_integer('kern.memorystatus_level', ctypes.c_int) // 100
 
-    KERNEL_PRESSURE = {2: 'pause', 4: 'kill'}  # DISPATCH_MEMORYPRESSURE_WARN, _CRITICAL
+    KERNEL_PRESSURE = {2: 'warn', 4: 'critical'}  # DISPATCH_MEMORYPRESSURE_WARN, _CRITICAL
 
     def kernel_pressure():
         return KERNEL_PRESSURE.get(sysctl_integer('kern.memorystatus_vm_pressure_level', ctypes.c_int))
@@ -497,9 +499,12 @@ class Launcher:
         waited = False
         while True:
             available = available_memory()
+            # Warn holds back new compiles; pausing running ones frees nothing.
+            held_back = self.limits.headroom is not None and kernel_pressure() is not None
             with State() as state:
                 state.prune_dead()
-                if state.fits(self.limits, self.key, reservation, 0, available):
+                if ((not held_back or not state.holders(excluding=self.key))
+                        and state.fits(self.limits, self.key, reservation, 0, available)):
                     state.set_job(self.key, state='running', reserved=reservation, want=reservation,
                                   used=0, admitted=time.time())
                     break
@@ -556,7 +561,8 @@ class Launcher:
                     self.kill(reserved)
                 wanted = reserved if reason == 'pressure' else max(int(self.peak * MARGIN),
                                                                    reserved + GROW_MINIMUM)
-                resumed, victim = self.try_resume(wanted, usage, available)
+                still_pressed = reason == 'pressure' and self.pressure(available) is not None
+                resumed, victim = self.try_resume(wanted, usage, available, still_pressed)
                 if resumed:
                     paused_seconds += time.monotonic() - since
                     paused = None
@@ -578,9 +584,9 @@ class Launcher:
         if limits.headroom is None:
             return None
         kernel = kernel_pressure()
-        if limits.kill_below is not None and (available < limits.kill_below or kernel == 'kill'):
+        if limits.kill_below is not None and (available < limits.kill_below or kernel == 'critical'):
             return 'kill'
-        if available < limits.pause_below or kernel is not None:
+        if available < limits.pause_below or kernel == 'critical':
             return 'pause'
         return None
 
@@ -601,14 +607,14 @@ class Launcher:
             state.set_job(self.key, state='paused', want=wanted, paused_at=time.time(), reason='growth')
             return False
 
-    def try_resume(self, wanted, usage, available):
+    def try_resume(self, wanted, usage, available, still_pressed=False):
         """(resumed, should this job be killed to break a deadlock)."""
         with State() as state:
             state.prune_dead()
             job = state.jobs[self.key]
             anchor = state.anchor() == self.key
-            if (anchor and job.get('reason') == 'pressure') or state.fits(
-                    self.limits, self.key, wanted, usage, available, margin=self.limits.hysteresis):
+            if (anchor and job.get('reason') == 'pressure') or (not still_pressed and state.fits(
+                    self.limits, self.key, wanted, usage, available, margin=self.limits.hysteresis)):
                 state.set_job(self.key, state='running', reserved=wanted, want=wanted, reason=None)
                 return True, False
             if any(other['state'] == 'running' for other in state.jobs.values()):

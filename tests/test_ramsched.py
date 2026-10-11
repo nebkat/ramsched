@@ -221,7 +221,32 @@ class LauncherTest(unittest.TestCase):
         self.assertEqual([(event[1], event[-1]) for event in kills], [(str(third.pid), 'pressure')])
         self.assertIn('requeue', [event[0] for event in self.events()])
 
-    def test_kernel_pressure_pauses_and_critical_kills(self):
+    def set_pressure(self, level):
+        pressure = self.available_file + '.pressure'
+        if level is None:
+            os.remove(pressure)
+            return
+        with open(pressure, 'w') as file:
+            file.write(level)
+
+    def test_kernel_warn_holds_back_new_compiles_only(self):
+        environment = self.headroom_environment(10, 4, 3, 2)
+        first = self.start(50, 4, 'warn1.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(0.5)
+        second = self.start(50, 4, 'warn2.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(1)
+        self.set_pressure('warn')
+        third = self.start(50, 1, 'warn3.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(1.5)
+        self.assertEqual(self.ledger()[str(third.pid)]['state'], 'waiting')
+        self.set_pressure(None)
+        for process in (first, second, third):
+            self.assertEqual(process.wait(), 0)
+        events = self.events()
+        self.assertFalse([event for event in events if event[0] in ('pause', 'kill')])
+        self.assertIn([str(third.pid), 'waited'], [event[1:4:2] for event in events if event[0] == 'admit'])
+
+    def test_kernel_critical_pauses_and_kills(self):
         environment = self.headroom_environment(10, 4, 3, 2)
         first = self.start(50, 6, 'kernel1.o', RAMSCHED_DEFAULT='0.2', **environment)
         time.sleep(0.5)
@@ -229,19 +254,32 @@ class LauncherTest(unittest.TestCase):
         time.sleep(0.5)
         third = self.start(50, 6, 'kernel3.o', RAMSCHED_DEFAULT='0.2', **environment)
         time.sleep(1)
-        pressure = self.available_file + '.pressure'
-        with open(pressure, 'w') as file:
-            file.write('pause')
+        self.set_pressure('critical')
         self.wait_for_event('pause')
-        with open(pressure, 'w') as file:
-            file.write('kill')
         self.wait_for_event('kill')
-        os.remove(pressure)
+        self.set_pressure(None)
         for process in (first, second, third):
             self.assertEqual(process.wait(), 0)
         events = self.events()
         self.assertNotIn(str(first.pid), [event[1] for event in events if event[0] in ('pause', 'kill')])
         self.assertEqual([event[1] for event in events if event[0] == 'kill'], [str(third.pid)])
+
+    def test_pressure_pause_lasts_until_the_pressure_ends(self):
+        environment = self.headroom_environment(10, 4, 3, None)
+        first = self.start(50, 5, 'hold1.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(0.5)
+        second = self.start(50, 5, 'hold2.o', RAMSCHED_DEFAULT='0.2', **environment)
+        time.sleep(1)
+        self.set_pressure('critical')
+        self.wait_for_event('pause')
+        time.sleep(1.5)
+        events = self.events()
+        self.assertEqual(len([event for event in events if event[0] == 'pause']), 1)
+        self.assertNotIn('resume', [event[0] for event in events])
+        self.set_pressure(None)
+        self.assertEqual(first.wait(), 0)
+        self.assertEqual(second.wait(), 0)
+        self.assertIn('resume', [event[0] for event in self.events()])
 
     def test_a_lone_compile_is_never_paused_for_pressure(self):
         environment = self.headroom_environment(1, 4, 3, 2)

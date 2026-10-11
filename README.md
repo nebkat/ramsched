@@ -62,10 +62,10 @@ Sizes are in GB.
 3. **Watch.** The compile's memory (macOS `phys_footprint`, Linux RSS, summed over its
    process tree) is polled every 100 ms. At the reservation it grows if the limits allow,
    or is paused with `SIGSTOP` until they do.
-4. **Defend the headroom.** Below the pause level every compile but the oldest pauses;
-   below the kill level the newest is killed and requeued, one every 2 s, which is the
-   only thing that frees memory. The oldest compile is never paused or killed for
-   pressure, so a build always progresses.
+4. **Defend the headroom.** Below the pause level every compile but the oldest pauses
+   until available memory is back above it; below the kill level the newest is killed and
+   requeued, one every 2 s, which is the only thing that frees memory. The oldest compile
+   is never paused or killed for pressure, so a build always progresses.
 5. **Break deadlocks.** If every compile holding memory is paused, the one that has run
    the shortest is killed and requeued with a larger reservation.
 6. **Learn.** The peak is recorded under the object path relative to the build directory,
@@ -82,8 +82,10 @@ parallelism, never the build.
 - **Linux**: `MemAvailable`, or the enclosing cgroup's limit minus its usage when lower.
   It counts free memory and cache the kernel can drop.
 - **macOS**: the system's own available percentage (`kern.memorystatus_level`, what
-  `memory_pressure` reports as free), plus the kernel's pressure level: *warn* pauses and
-  *critical* kills. macOS keeps the percentage up by compressing other programs' memory,
+  `memory_pressure` reports as free), plus the kernel's pressure level: *warn* admits no
+  compile beside those running (a paused compile keeps its memory, so pausing on a
+  pressure level that can last minutes only slows the build), and *critical* pauses and
+  kills as the pause and kill levels do. macOS keeps the percentage up by compressing other programs' memory,
   so it trails real allocations by seconds and understates them; the pressure level is
   what catches the rest. Headroom on macOS is therefore softer than on Linux: a build can
   push other programs into compression before ramsched reacts.
